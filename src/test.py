@@ -1,4 +1,5 @@
 import pickle
+import sqlite3
 from policy_gradients.agent import Trainer
 import git
 import numpy as np
@@ -15,17 +16,41 @@ import torch.optim as optim
 from cox.store import Store, schema_from_dict
 from run import main, add_common_parser_opts, override_json_params
 from auto_LiRPA.eps_scheduler import LinearScheduler
+import logging
+
+logging.disable(logging.INFO)
 
 
 def main(params):
     override_params = copy.deepcopy(params)
     excluded_params = ['config_path', 'out_dir_prefix', 'num_episodes', 'row_id', 'exp_id',
-            'load_model', 'seed', 'deterministic', 'scan_config', 'compute_kl_cert', 'use_full_backward']
+            'load_model', 'seed', 'deterministic', 'noise_factor', 'compute_kl_cert', 'use_full_backward', 'sqlite_path', 'early_terminate']
     sarsa_params = ['sarsa_enable', 'sarsa_steps', 'sarsa_eps', 'sarsa_reg', 'sarsa_model_path']
+    imit_params =  ['imit_enable', 'imit_epochs', 'imit_model_path', 'imit_lr']
+ 
     # original_params contains all flags in config files that are overridden via command.
     for k in list(override_params.keys()):
         if k in excluded_params:
             del override_params[k]
+
+    if params['sqlite_path']:
+        print(f"Will save results in sqlite database in {params['sqlite_path']}")
+        connection = sqlite3.connect(params['sqlite_path'])
+        cur = connection.cursor()
+        cur.execute('''create table if not exists attack_results
+              (method varchar(20),
+              mean_reward real,
+              std_reward real,
+              min_reward real,
+              max_reward real,
+              sarsa_eps real,
+              sarsa_reg real,
+              sarsa_steps integer,
+              deterministic bool,
+              early_terminate bool)''')
+        connection.commit()
+        # We will set this flag to True we break early.
+        early_terminate = False
 
     # Append a prefix for output path.
     if params['out_dir_prefix']:
@@ -37,7 +62,7 @@ def main(params):
         # First we need to create the model using the given config file.
         json_params = json.load(open(params['config_path']))
         
-        params = override_json_params(params, json_params, excluded_params + sarsa_params)
+        params = override_json_params(params, json_params, excluded_params + sarsa_params + imit_params)
 
     if params['sarsa_enable']:
         assert params['attack_method'] == "none" or params['attack_method'] is None, \
@@ -85,6 +110,17 @@ def main(params):
 
     rewards = []
 
+    print('Gaussian noise in policy:')
+    print(torch.exp(p.policy_model.log_stdev))
+    original_stdev = p.policy_model.log_stdev.clone().detach()
+    if params['noise_factor'] != 1.0:
+        p.policy_model.log_stdev.data[:] += np.log(params['noise_factor'])
+    if params['deterministic']:
+        print('Policy runs in deterministic mode. Ignoring Gaussian noise.')
+        p.policy_model.log_stdev.data[:] = -100
+    print('Gaussian noise in policy (after adjustment):')
+    print(torch.exp(p.policy_model.log_stdev))
+
     if params['sarsa_enable']:
         num_steps = params['sarsa_steps']
         # learning rate scheduler: linearly annealing learning rate after 
@@ -110,12 +146,33 @@ def main(params):
                 'metadata': params,
                 }
         torch.save(saved_model, params['sarsa_model_path'])
+    elif params['imit_enable']:
+        num_epochs = params['imit_epochs']
+        num_episodes = params['num_episodes']
+        print('\n\n'+'Start collecting data\n'+'-'*80)
+        for i in range(num_episodes):
+            print('Collecting %d / %d episodes' % (i+1, num_episodes))
+            ep_length, ep_reward, actions, action_means, states, kl_certificates = p.run_test(compute_bounds=params['compute_kl_cert'], use_full_backward=params['use_full_backward'], original_stdev=original_stdev)
+            not_dones = np.ones(len(actions))
+            not_dones[-1] = 0
+            if i == 0:
+                all_actions = actions.copy()
+                all_states = states.copy()
+                all_not_dones = not_dones.copy()
+            else:
+                all_actions = np.concatenate((all_actions, actions), axis=0) 
+                all_states = np.concatenate((all_states, states), axis=0)
+                all_not_dones = np.concatenate((all_not_dones, not_dones))
+        print('Collected actions shape:', all_actions.shape)
+        print('Collected states shape:', all_states.shape)
+        p.setup_imit(lr=params['imit_lr'])
+        p.imit_steps(torch.from_numpy(all_actions), torch.from_numpy(all_states), torch.from_numpy(all_not_dones), num_epochs)
+        saved_model = {
+                'state_dict': p.imit_network.state_dict(),
+                'metadata': params,
+                }
+        torch.save(saved_model, params['imit_model_path'])
     else:
-        print('Gaussian noise in policy:')
-        print(torch.exp(p.policy_model.log_stdev))
-        if params['deterministic']:
-            print('Policy runs in deterministic mode. Ignoring Gaussian noise.')
-            p.policy_model.log_stdev.data[:] = -100
         num_episodes = params['num_episodes']
         all_rewards = []
         all_lens = []
@@ -123,7 +180,7 @@ def main(params):
         
         for i in range(num_episodes):
             print('Episode %d / %d' % (i+1, num_episodes))
-            ep_length, ep_reward, actions, action_means, states, kl_certificates = p.run_test(compute_bounds=params['compute_kl_cert'], use_full_backward=params['use_full_backward'])
+            ep_length, ep_reward, actions, action_means, states, kl_certificates = p.run_test(compute_bounds=params['compute_kl_cert'], use_full_backward=params['use_full_backward'], original_stdev=original_stdev)
             if i == 0:
                 all_actions = actions.copy()
                 all_states = states.copy()
@@ -135,6 +192,21 @@ def main(params):
                 all_kl_certificates.append(kl_certificates)
             all_rewards.append(ep_reward)
             all_lens.append(ep_length)
+            # Current step mean, std, min and max
+            mean_reward, std_reward, min_reward, max_reward = np.mean(all_rewards), np.std(all_rewards), np.min(all_rewards), np.max(all_rewards)
+
+            if i > num_episodes // 5 and params['early_terminate'] and params['sqlite_path'] and params['attack_method'] != 'none':
+                # Attempt to early terminiate if some other attacks have done with low reward.
+                cur.execute("SELECT MIN(mean_reward) FROM attack_results WHERE deterministic=?;", (params['deterministic'], ))
+                current_best_reward = cur.fetchone()[0]
+                print(f'current best: {current_best_reward}, ours: {mean_reward} +/- {std_reward}, min: {min_reward}')
+                # Terminiate if mean - 2*std is worse than best, or our min is worse than best.
+                if current_best_reward is not None and ((current_best_reward < mean_reward - 2 * std_reward) or
+                        (min_reward > current_best_reward)):
+                    print('terminating early!')
+                    early_terminate = True
+                    break
+                
     
         attack_dir = 'attack-{}-eps-{}'.format(params['attack_method'], params['attack_eps'])
         if 'sarsa' in params['attack_method']:
@@ -151,11 +223,41 @@ def main(params):
         with open(os.path.join(save_path, 'params.json'), 'w') as f:
             json.dump(params, f, indent=4)
 
-        print('\n')
-        print('all rewards:', all_rewards) 
-        print('rewards stats:\nmean: {}, std:{}, min:{}, max:{}'.format(np.mean(all_rewards), np.std(all_rewards), np.min(all_rewards), np.max(all_rewards)))
+        mean_reward, std_reward, min_reward, max_reward = np.mean(all_rewards), np.std(all_rewards), np.min(all_rewards), np.max(all_rewards)
         if params['compute_kl_cert']:
             print('KL certificates stats: mean: {}, std: {}, min: {}, max: {}'.format(np.mean(all_kl_certificates), np.std(all_kl_certificates), np.min(all_kl_certificates), np.max(all_kl_certificates)))
+        # write results to sqlite.
+        if params['sqlite_path']:
+            method = params['attack_method']
+            if params['attack_method'] == "sarsa":
+                # Load sarsa parameters from checkpoint
+                sarsa_ckpt = torch.load(params['attack_sarsa_network'])
+                sarsa_meta = sarsa_ckpt['metadata']
+                sarsa_eps = sarsa_meta['sarsa_eps'] if 'sarsa_eps' in sarsa_meta else -1.0
+                sarsa_reg = sarsa_meta['sarsa_reg'] if 'sarsa_reg' in sarsa_meta else -1.0
+                sarsa_steps = sarsa_meta['sarsa_steps'] if 'sarsa_steps' in sarsa_meta else -1
+            elif params['attack_method'] == "sarsa+action":
+                sarsa_eps = -1.0
+                sarsa_reg = params['attack_sarsa_action_ratio']
+                sarsa_steps = -1
+            else:
+                sarsa_eps = -1.0
+                sarsa_reg = -1.0
+                sarsa_steps = -1
+            try:
+                cur.execute("INSERT INTO attack_results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                            (method, mean_reward, std_reward, min_reward, max_reward, sarsa_eps, sarsa_reg, sarsa_steps, params['deterministic'], early_terminate))
+                connection.commit()
+            except sqlite3.OperationalError as e:
+                import traceback
+                traceback.print_exc()
+                print('Cannot insert into the SQLite table. Give up.')
+            else:
+                print(f'results saved to database {params["sqlite_path"]}')
+            connection.close()
+        print('\n')
+        print('all rewards:', all_rewards)
+        print('rewards stats:\nmean: {}, std:{}, min:{}, max:{}'.format(mean_reward, std_reward, min_reward, max_reward))
           
 
 def get_parser():
@@ -170,16 +272,22 @@ def get_parser():
     parser.add_argument('--compute-kl-cert', action='store_true', help='compute KL certificate')
     parser.add_argument('--use-full-backward', action='store_true', help='Use full backward LiRPA bound for computing certificates')
     parser.add_argument('--deterministic', action='store_true', help='disable Gaussian noise in action for evaluation')
+    parser.add_argument('--noise-factor', type=float, default=1.0, help='increase the noise (Gaussian std) by this factor.')
     parser.add_argument('--load-model', type=str, help='load a pretrained model file', default='')
     parser.add_argument('--seed', type=int, help='random seed', default=1234)
     # Sarsa training related options.
     parser.add_argument('--sarsa-enable', action='store_true', help='train a sarsa attack model.')
     parser.add_argument('--sarsa-steps', type=int, help='Sarsa training steps.', default=30)
     parser.add_argument('--sarsa-model-path', type=str, help='path to save the sarsa value network.', default='sarsa.model')
-    parser.add_argument('--sarsa-eps', type=float, help='eps for actions for sarsa training.', default=0.3)
+    parser.add_argument('--imit-enable', action='store_true', help='train a imit attack model.')
+    parser.add_argument('--imit-epochs', type=int, help='Imit training steps.', default=100)
+    parser.add_argument('--imit-model-path', type=str, help='path to save the imit policy network.', default='imit.model')
+    parser.add_argument('--imit-lr', type=float, help='lr for imitation learning training', default=1e-3)
+    parser.add_argument('--sarsa-eps', type=float, help='eps for actions for sarsa training.', default=0.02)
     parser.add_argument('--sarsa-reg', type=float, help='regularization term for sarsa training.', default=0.1)
     # Other configs
-    parser.add_argument('--scan-config', type=str, default=None)
+    parser.add_argument('--sqlite-path', type=str, help='save results to a sqlite database.', default='')
+    parser.add_argument('--early-terminate', action='store_true', help='terminate attack early if low attack reward detected in sqlite.')
     parser = add_common_parser_opts(parser)
     
     return parser
@@ -190,6 +298,14 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.load_model:
         assert args.config_path, "Need to specificy a config file when loading a pretrained model."
+
+    if args.early_terminate:
+        assert args.sqlite_path != '', "Need to specify --sqlite-path to terminate early."
+
+    if args.sarsa_enable:
+        if args.sqlite_path != '':
+            print("When --sarsa-enable is specified, --sqlite-path and --early-terminate will be ignored.")
+
     params = vars(args)
     seed = params['seed']
     

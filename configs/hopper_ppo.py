@@ -21,6 +21,7 @@ PARAMS = {
     "advanced_logging": [False],
     "save_iters": [10],
     "train_steps": [976],
+    "robust_ppo_eps": [0.075], # used for attack
 }
 
 generate_configs(BASE_CONFIG, PARAMS)

@@ -10,7 +10,7 @@ with open("../src/MuJoCo.json") as f:
 PARAMS = {
     "game": ["Hopper-v2"],
     "mode": ["robust_ppo"],
-    "out_dir": ["robust_ppo_convex_hopper/agents"],
+    "out_dir": ["robust_ppo_convex_hopper_best/agents"],
     "norm_rewards": ["returns"],
     "initialization": ["orthogonal"],
     "anneal_lr": [True],
@@ -21,7 +21,7 @@ PARAMS = {
     "advanced_logging": [False],
     "save_iters": [10],
     "robust_ppo_eps": [0.075],
-    "robust_ppo_reg": [0.03] * 32,
+    "robust_ppo_reg": [0.1] * 32,
     "train_steps": [976],
     "robust_ppo_eps_scheduler_opts": ["start=1,length=732"],
     "robust_ppo_beta": [1.0],

@@ -15,12 +15,13 @@ PARAMS = {
     "initialization": ["orthogonal"],
     "anneal_lr": [True],
     "value_clipping": [True],
-    "ppo_lr_adam": [1.5e-4] * 72,
-    "val_lr": [1e-4],
+    "ppo_lr_adam": [5e-5] * 72,
+    "val_lr": [1e-5],
     "cpu": [True],
     "advanced_logging": [False],
     "save_iters": [100],
     "train_steps": [4882],
+    "robust_ppo_eps": [0.075], # used for attack
 }
 
 generate_configs(BASE_CONFIG, PARAMS)

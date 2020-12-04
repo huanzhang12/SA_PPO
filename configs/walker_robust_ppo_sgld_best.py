@@ -10,7 +10,7 @@ with open("../src/MuJoCo.json") as f:
 PARAMS = {
     "game": ["Walker2d-v2"],
     "mode": ["robust_ppo"],
-    "out_dir": ["robust_ppo_sgld_walker/agents"],
+    "out_dir": ["robust_ppo_sgld_walker_best/agents"],
     "norm_rewards": ["returns"],
     "initialization": ["orthogonal"],
     "anneal_lr": [True],

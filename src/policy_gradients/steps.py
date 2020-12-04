@@ -1,5 +1,9 @@
+import functools
 import torch as ch
+import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 import numpy as np
+import math
 import time
 from tqdm import tqdm
 from torch.nn.utils import parameters_to_vector as flatten
@@ -25,14 +29,25 @@ Layout of this file:
         - ppo_step
         - trpo_step
 '''
-def adv_normalize(adv):
-    std = adv.std()
+def adv_normalize(adv, mask=None):
+    if mask is None:
+        if adv.nelement() == 1:
+            return adv
+        std = adv.std()
+        mean = adv.mean()
+    else:
+        masked_adv = adv[mask]
+        if masked_adv.nelement() == 1:
+            return adv
+        std = masked_adv.std()
+        mean = masked_adv.mean()
+
     
     assert std != 0. and not ch.isnan(std), 'Need nonzero std'
-    n_advs = (adv - adv.mean())/(adv.std()+1e-8)
+    n_advs = (adv - mean)/(std + 1e-8)
     return n_advs
 
-def surrogate_reward(adv, *, new, old, clip_eps=None):
+def surrogate_reward(adv, *, new, old, clip_eps=None, mask=None, normalize=True):
     '''
     Computes the surrogate reward for TRPO and PPO:
     R(\theta) = E[r_t * A_t]
@@ -48,8 +63,11 @@ def surrogate_reward(adv, *, new, old, clip_eps=None):
     '''
     log_ps_new, log_ps_old = new, old
 
-    # Normalized Advantages
-    n_advs = adv_normalize(adv)
+    if normalize:
+        # Normalized Advantages
+        n_advs = adv_normalize(adv, mask)
+    else:
+        n_advs = adv
 
     assert shape_equal_cmp(log_ps_new, log_ps_old, n_advs)
 
@@ -67,7 +85,7 @@ def surrogate_reward(adv, *, new, old, clip_eps=None):
 # Also logs explained variance = MSE(values, targets)/Var[targets]
 #####
 
-def value_loss_gae(vs, _, advantages, not_dones, params, old_vs, store=None, re=False):
+def value_loss_gae(vs, _, advantages, not_dones, params, old_vs, mask=None, store=None, re=False, reduction='mean'):
     '''
     GAE-based loss for the value function:
         L_t = ((v_t + A_t).detach() - v_{t})
@@ -80,7 +98,7 @@ def value_loss_gae(vs, _, advantages, not_dones, params, old_vs, store=None, re=
     # We want the current values are close to them.
     val_targ = (old_vs + advantages).detach()
     assert shape_equal_cmp(val_targ, vs, not_dones, old_vs, advantages)
-    assert len(vs.shape) == 1
+    assert len(vs.shape) == 1 or len(vs.shape) == 2
 
     try:
         vs_clipped = old_vs + ch.clamp(vs - old_vs, -params.CLIP_VAL_EPS, params.CLIP_VAL_EPS)
@@ -88,7 +106,9 @@ def value_loss_gae(vs, _, advantages, not_dones, params, old_vs, store=None, re=
         vs_clipped = old_vs + ch.clamp(vs - old_vs, -params.CLIP_EPS, params.CLIP_EPS)
         
     # Don't incur loss from last timesteps (since there's no return to use)
-    sel = not_dones.bool()
+    sel = ch.logical_and(not_dones.bool(), mask)
+    # print('selected', sel.sum().item())
+    assert shape_equal_cmp(vs, sel)
     val_loss_mat_unclipped = (vs - val_targ)[sel].pow(2)
     val_loss_mat_clipped = (vs_clipped - val_targ)[sel].pow(2)
 
@@ -103,7 +123,12 @@ def value_loss_gae(vs, _, advantages, not_dones, params, old_vs, store=None, re=
 
     # assert shape_equal_cmp(val_loss_mat, vs)
     # Mean squared loss
-    mse = val_loss_mat.mean()
+    if reduction == 'mean':
+        mse = val_loss_mat.mean()
+    elif reduction == 'sum':
+        mse = val_loss_mat.sum()
+    else:
+        raise ValueError('Unknown reduction ' + reduction)
 
     if re:
         # Relative error.
@@ -116,7 +141,7 @@ def value_loss_gae(vs, _, advantages, not_dones, params, old_vs, store=None, re=
     return mse
 
 def value_loss_returns(vs, returns, advantages, not_dones, params, old_vs,
-                       store=None, re=False):
+                       mask=None, store=None, re=False):
     '''
     Returns (with time input) loss for the value function:
         L_t = (R_t - v(s, t))
@@ -161,7 +186,7 @@ def value_step(all_states, returns, advantages, not_dones, net,
     '''
 
     # (sharing weights) XOR (old_vs is None)
-    assert params.SHARE_WEIGHTS ^ (old_vs is None)
+    # assert params.SHARE_WEIGHTS ^ (old_vs is None)
 
     # Options for value function
     VALUE_FUNCS = {
@@ -186,46 +211,108 @@ def value_step(all_states, returns, advantages, not_dones, net,
         if test_saps is not None:
             old_test_vs = net(test_saps.states).squeeze(-1)
 
+
+    """
+    print('all_states', all_states.size())
+    print('returns', returns.size())
+    print('advantages', advantages.size())
+    print('not_dones', not_dones.size())
+    print('old_vs', old_vs.size())
+    """
+
+
     r = range(params.VAL_EPOCHS) if not should_tqdm else \
                             tqdm(range(params.VAL_EPOCHS))
+
+    if params.HISTORY_LENGTH > 0 and params.USE_LSTM_VAL:
+        # LSTM policy. Need to go over all episodes instead of states.
+        batches, alive_masks, time_masks, lengths = pack_history([all_states, returns, not_dones, advantages, old_vs], not_dones, max_length=params.HISTORY_LENGTH)
+        assert not params.SHARE_WEIGHTS
+
     for i in r:
-        # Create minibatches with shuffuling
-        state_indices = np.arange(returns.nelement())
-        np.random.shuffle(state_indices)
-        splits = np.array_split(state_indices, params.NUM_MINIBATCHES)
-
-        assert shape_equal_cmp(returns, advantages, not_dones, old_vs)
-
-        # Minibatch SGD
-        for selected in splits:
+        if params.HISTORY_LENGTH > 0 and params.USE_LSTM_VAL:
+            # LSTM policy. Need to go over all episodes instead of states.
+            hidden = None
             val_opt.zero_grad()
+            val_loss = 0.0
+            for i, batch in enumerate(batches):
+                # Now we get chunks of time sequences, each of them with a maximum length of params.HISTORY_LENGTH.
+                # select log probabilities, advantages of this minibatch.
+                batch_states, batch_returns, batch_not_dones, batch_advs, batch_old_vs = batch
+                mask = time_masks[i]
+                # keep only the alive hidden states.
+                if hidden is not None:
+                    # print('hidden[0]', hidden[0].size())
+                    hidden = [h[:, alive_masks[i], :].detach() for h in hidden]
+                    # print('hidden[0]', hidden[0].size())
+                vs, hidden = net.multi_forward(batch_states, hidden=hidden)
+                vs = vs.squeeze(-1)
+                """
+                print('vs', vs.size())
+                print('batch_states', batch_states.size())
+                print('batch_returns', batch_returns.size())
+                print('batch_not_dones', batch_not_dones.size())
+                print('batch_advs', batch_advs.size())
+                print('batch_old_vs', batch_old_vs.size())
+                input()
+                """
+                """
+                print('old')
+                print(batch_old_vs)
+                print('new')
+                print(vs * mask)
+                print('diff')
+                print((batch_old_vs - vs * mask).pow(2).sum().item())
+                input()
+                """
+                vf = VALUE_FUNCS[params.VALUE_CALC]
+                batch_val_loss = vf(vs, batch_returns, batch_advs, batch_not_dones, params,
+                              batch_old_vs, mask=mask, store=store, reduction='sum')
+                val_loss += batch_val_loss
 
-            def sel(*args):
-                return [v[selected] for v in args]
-
-            def to_cuda(*args):
-                return [v.cuda() for v in args]
-
-            # Get a minibatch (64) of returns, advantages, etc.
-            tup = sel(returns, advantages, not_dones, old_vs, all_states)
-            if should_cuda: tup = to_cuda(*tup)
-            sel_rets, sel_advs, sel_not_dones, sel_ovs, sel_states = tup
-            # Value prediction of current network given the states.
-            vs = net(sel_states).squeeze(-1)
-            assert shape_equal_cmp(vs, selected)
-
-            vf = VALUE_FUNCS[params.VALUE_CALC]
-            val_loss = vf(vs, sel_rets, sel_advs, sel_not_dones, params,
-                          sel_ovs, store)
-
-            # If we are sharing weights, then value_step gets called 
-            # once per policy optimizer step anyways, so we only do one batch
-            if params.SHARE_WEIGHTS:
-                return val_loss
-
-            # From now on, params.SHARE_WEIGHTS must be False
+            val_loss = val_loss / all_states.size(0)
             val_loss.backward()
             val_opt.step()
+        else:
+            # Create minibatches with shuffuling
+            state_indices = np.arange(returns.nelement())
+            np.random.shuffle(state_indices)
+            splits = np.array_split(state_indices, params.NUM_MINIBATCHES)
+
+            assert shape_equal_cmp(returns, advantages, not_dones, old_vs)
+
+            # Minibatch SGD
+            for selected in splits:
+                val_opt.zero_grad()
+
+                def sel(*args):
+                    return [v[selected] for v in args]
+
+                def to_cuda(*args):
+                    return [v.cuda() for v in args]
+
+                # Get a minibatch (64) of returns, advantages, etc.
+                tup = sel(returns, advantages, not_dones, old_vs, all_states)
+                mask = ch.tensor(True)
+
+                if should_cuda: tup = to_cuda(*tup)
+                sel_rets, sel_advs, sel_not_dones, sel_ovs, sel_states = tup
+
+                # Value prediction of current network given the states.
+                vs = net(sel_states).squeeze(-1)
+
+                vf = VALUE_FUNCS[params.VALUE_CALC]
+                val_loss = vf(vs, sel_rets, sel_advs, sel_not_dones, params,
+                              sel_ovs, mask=mask, store=store)
+
+                # If we are sharing weights, then value_step gets called 
+                # once per policy optimizer step anyways, so we only do one batch
+                if params.SHARE_WEIGHTS:
+                    return val_loss
+
+                # From now on, params.SHARE_WEIGHTS must be False
+                val_loss.backward()
+                val_opt.step()
         if should_tqdm:
             if test_saps is not None: 
                 vs = net(test_saps.states).squeeze(-1)
@@ -233,8 +320,72 @@ def value_step(all_states, returns, advantages, not_dones, net,
                     test_saps.not_dones, params, old_test_vs, None)
             r.set_description(f'vf_train: {val_loss.mean().item():.2f}'
                               f'vf_test: {test_loss.mean().item():.2f}')
+        print(f'val_loss={val_loss.item():8.5f}')
 
     return val_loss
+
+
+def pack_history(features, not_dones, max_length):
+    # Features is a list, each element has dimension (N, state_dim) or (N, ) where N contains a few episodes
+    # not_dones splits these episodes (0 in not_dones is end of an episode)
+    nnz = ch.nonzero(1.0 - not_dones, as_tuple=False).view(-1).cpu().numpy()
+    # nnz has the position where not_dones = 0 (end of episode)
+    assert isinstance(features, list)
+    # Check dimension. All tensors must have the same dimension.
+    size = features[0].size(0)
+    for t in features:
+        assert size == t.size(0)
+    all_pieces = [[] for i in range(len(features))]
+    lengths = []
+    start = 0
+    for i in nnz:
+        end = i + 1
+        for (a, b) in zip(all_pieces, features):
+            a.append(b[start:end])
+        lengths.append(end - start)
+        start = end
+    # The last episode is missing, unless the previous episode end at the last element.
+    if end != size:
+        for (a, b) in zip(all_pieces, features):
+            a.append(b[end:])
+        lengths.append(size - end)
+    # First pad to longest sequence
+    padded_features = [pad_sequence(a, batch_first=True) for a in all_pieces]
+    # Then pad to a multiple of max_length
+    longest = padded_features[0].size(1)
+    extra = int(math.ceil(longest / max_length) * max_length - longest)
+    new_padded_features = []
+    for t in padded_features:
+        if t.ndim == 3:
+            new_tensor = ch.zeros(t.size(0), extra, t.size(2))
+        else:
+            new_tensor = ch.zeros(t.size(0), extra)
+        new_tensor = ch.cat([t, new_tensor], dim=1)
+        new_padded_features.append(new_tensor)
+    del padded_features
+    # now divide padded features into chunks with max_length.
+    nbatches = new_padded_features[0].size(1) // max_length
+    alive_masks = []  # which batch still alives after a chunk
+    # time step masks for each chunk, each batch.
+    time_masks = []
+    batches = [[] for i in range(nbatches)]  # batch of batches
+    alive = ch.tensor(lengths)
+    alive_iter = ch.tensor(lengths)
+    for i in range(nbatches):
+        full_mask = alive > 0
+        iter_mask = alive_iter > 0
+        for t in new_padded_features:
+            # only keep the tensors that are alive
+            batches[i].append(t[full_mask, i * max_length : i * max_length + max_length])
+        # Remove deleted batches
+        alive_iter = alive_iter[iter_mask]
+        time_mask = alive_iter.view(-1, 1) > ch.arange(max_length).view(1, -1)
+        alive -= max_length
+        alive_iter -= max_length
+        alive_masks.append(iter_mask)
+        time_masks.append(time_mask)
+    return batches, alive_masks, time_masks, lengths
+
 
 def ppo_step(all_states, actions, old_log_ps, rewards, returns, not_dones, 
                 advs, net, params, store, opt_step):
@@ -260,85 +411,190 @@ def ppo_step(all_states, actions, old_log_ps, rewards, returns, not_dones,
         orig_vs = net.get_value(all_states).squeeze(-1).view([params.NUM_ACTORS, -1])
         old_vs = orig_vs.detach()
 
+    """
+    print(all_states.size())
+    print(actions.size())
+    print(old_log_ps.size())
+    print(advs.size())
+    print(params.HISTORY_LENGTH)
+    print(not_dones.size())
+    """
+
+    if params.HISTORY_LENGTH > 0:
+        # LSTM policy. Need to go over all episodes instead of states.
+        # We normalize all advantages at once instead of batch by batch, since each batch may contain different number of samples.
+        normalized_advs = adv_normalize(advs)
+        batches, alive_masks, time_masks, lengths = pack_history([all_states, actions, old_log_ps, normalized_advs], not_dones, max_length=params.HISTORY_LENGTH)
+
     for _ in range(params.PPO_EPOCHS):
-        # State is in shape (experience_size, observation_size). Usually 2048.
-        state_indices = np.arange(all_states.shape[0])
-        np.random.shuffle(state_indices)
-        # We use a minibatch of states to do optimization, and each epoch contains several iterations.
-        splits = np.array_split(state_indices, params.NUM_MINIBATCHES)
-        # A typical mini-batch size is 2048/32=64
-        for selected in splits:
-            def sel(*args):
-                return [v[selected] for v in args]
+        if params.HISTORY_LENGTH > 0:
+            # LSTM policy. Need to go over all episodes instead of states.
+            params.POLICY_ADAM.zero_grad()
+            hidden = None
+            surrogate = 0.0
+            for i, batch in enumerate(batches):
+                # Now we get chunks of time sequences, each of them with a maximum length of params.HISTORY_LENGTH.
+                # select log probabilities, advantages of this minibatch.
+                batch_states, batch_actions, batch_old_log_ps, batch_advs = batch
+                mask = time_masks[i]
+                """
+                print('batch states', batch_states.size())
+                print('batch actions', batch_actions.size())
+                print('batch old_log_ps', batch_old_log_ps.size())
+                print('batch advs', batch_advs.size())
+                print('alive mask', alive_masks[i].size(), alive_masks[i].sum())
+                print('mask', mask.size())
+                """
+                # keep only the alive hidden states.
+                if hidden is not None:
+                    # print('hidden[0]', hidden[0].size())
+                    hidden = [h[:, alive_masks[i], :].detach() for h in hidden]
+                    # print('hidden[0]', hidden[0].size())
+                # dist contains mean and variance of Gaussian.
+                mean, std, hidden = net.multi_forward(batch_states, hidden=hidden)
+                dist = mean, std
+                # Convert state distribution to log likelyhood.
+                new_log_ps = net.get_loglikelihood(dist, batch_actions)
+                # print('batch new_log_ps', new_log_ps.size())
+                """
+                print('old')
+                print(batch_old_log_ps)
+                print('new')
+                print(new_log_ps * mask)
+                print('diff')
+                print((batch_old_log_ps - new_log_ps * mask).pow(2).sum().item())
+                """
 
-            # old_log_ps: log probabilities of actions sampled based in experience buffer.
-            # advs: advantages of these states.
-            # both old_log_ps and advs are in shape (experience_size,) = 2048.
-            tup = sel(all_states, actions, old_log_ps, advs)
-            # select log probabilities, advantages of this minibatch.
-            batch_states, batch_actions, batch_old_log_ps, batch_advs = tup
+                shape_equal_cmp(new_log_ps, batch_old_log_ps)
 
-            # Forward propagation on current parameters (being constantly updated), to get distribution of these states
-            # dist contains mean and variance of Gaussian.
-            dist = net(batch_states)
-            # Convert state distribution to log likelyhood.
-            new_log_ps = net.get_loglikelihood(dist, batch_actions)
+                # Calculate rewards
+                # the surrogate rewards is basically exp(new_log_ps - old_log_ps) * advantage
+                # dimension is the same as minibatch size.
+                # We already normalized advs before. No need to normalize here.
+                unclp_rew = surrogate_reward(batch_advs, new=new_log_ps, old=batch_old_log_ps, mask=mask, normalize=False)
+                clp_rew = surrogate_reward(batch_advs, new=new_log_ps, old=batch_old_log_ps,
+                                           clip_eps=params.CLIP_EPS, mask=mask, normalize=False)
 
-            shape_equal_cmp(new_log_ps, batch_old_log_ps)
 
-            # Calculate rewards
-            # the surrogate rewards is basically exp(new_log_ps - old_log_ps) * advantage
-            # dimension is the same as minibatch size.
-            unclp_rew = surrogate_reward(batch_advs, new=new_log_ps, old=batch_old_log_ps)
-            clp_rew = surrogate_reward(batch_advs, new=new_log_ps, old=batch_old_log_ps,
-                                       clip_eps=params.CLIP_EPS)
+                # Total loss, is the min of clipped and unclipped reward for each state, averaged.
+                surrogate_batch = (-ch.min(unclp_rew, clp_rew) * mask).sum()
+                # We sum the batch loss here because each batch contains uneven number of trajactories.
+                surrogate = surrogate + surrogate_batch
 
+            # Divide surrogate loss by number of samples in this batch.
+            surrogate = surrogate / all_states.size(0)
             # Calculate entropy bonus
-            entropy_bonus = net.entropies(dist).mean()
-
-            # Total loss, is the min of clipped and unclipped reward for each state, averaged.
-            surrogate = -ch.min(unclp_rew, clp_rew).mean()
+            # So far, the entropy only depends on std and does not depend on time. No need to mask.
+            entropy_bonus = net.entropies(dist)
             entropy = -params.ENTROPY_COEFF * entropy_bonus
             loss = surrogate + entropy
-            
-            # If we are sharing weights, take the value step simultaneously 
-            # (since the policy and value networks depend on the same weights)
-            if params.SHARE_WEIGHTS:
-                tup = sel(returns, not_dones, old_vs)
-                batch_returns, batch_not_dones, batch_old_vs = tup
-                val_loss = value_step(batch_states, batch_returns, batch_advs,
-                                      batch_not_dones, net.get_value, None, params,
-                                      store, old_vs=batch_old_vs, opt_step=opt_step)
-                loss += params.VALUE_MULTIPLIER * val_loss
+            # optimizer (only ADAM)
+            loss.backward()
+            if params.CLIP_GRAD_NORM != -1:
+                ch.nn.utils.clip_grad_norm(net.parameters(), params.CLIP_GRAD_NORM)
+            params.POLICY_ADAM.step()
+        else:
+            # Memoryless policy.
+            # State is in shape (experience_size, observation_size). Usually 2048.
+            state_indices = np.arange(all_states.shape[0])
+            np.random.shuffle(state_indices)
+            # We use a minibatch of states to do optimization, and each epoch contains several iterations.
+            splits = np.array_split(state_indices, params.NUM_MINIBATCHES)
+            # A typical mini-batch size is 2048/32=64
+            for selected in splits:
+                def sel(*args, offset=0):
+                    if offset == 0:
+                        return [v[selected] for v in args]
+                    else:
+                        offset_selected = selected + offset
+                        return [v[offset_selected] for v in args]
 
-            # Optimizer step (Adam or SGD)
-            if params.POLICY_ADAM is None:
-                grad = ch.autograd.grad(loss, net.parameters())
-                flat_grad = flatten(grad)
-                if params.CLIP_GRAD_NORM != -1:
-                    norm_grad = ch.norm(flat_grad)
-                    flat_grad = flat_grad if norm_grad <= params.CLIP_GRAD_NORM else \
-                                flat_grad / norm_grad * params.CLIP_GRAD_NORM
+                # old_log_ps: log probabilities of actions sampled based in experience buffer.
+                # advs: advantages of these states.
+                # both old_log_ps and advs are in shape (experience_size,) = 2048.
+                # Using memoryless policy.
+                tup = sel(all_states, actions, old_log_ps, advs)
+                # select log probabilities, advantages of this minibatch.
+                batch_states, batch_actions, batch_old_log_ps, batch_advs = tup
+                # print(batch_actions.size())
+                # print(batch_advs.size())
 
-                assign(flatten(net.parameters()) - params.PPO_LR * flat_grad, net.parameters())
-            else:
-                params.POLICY_ADAM.zero_grad()
-                loss.backward()
-                if params.CLIP_GRAD_NORM != -1:
-                    ch.nn.utils.clip_grad_norm(net.parameters(), params.CLIP_GRAD_NORM)
-                params.POLICY_ADAM.step()
+                # Forward propagation on current parameters (being constantly updated), to get distribution of these states
+                # dist contains mean and variance of Gaussian.
+                dist = net(batch_states)
+                # print('dist', dist[0].size())
+                # print('batch_actions', batch_actions.size())
+                # Convert state distribution to log likelyhood.
+                new_log_ps = net.get_loglikelihood(dist, batch_actions)
+                # print('new_log_ps', new_log_ps.size())
+                # print('old_log_ps', batch_old_log_ps.size())
+
+                shape_equal_cmp(new_log_ps, batch_old_log_ps)
+
+                # Calculate rewards
+                # the surrogate rewards is basically exp(new_log_ps - old_log_ps) * advantage
+                # dimension is the same as minibatch size.
+                unclp_rew = surrogate_reward(batch_advs, new=new_log_ps, old=batch_old_log_ps)
+                clp_rew = surrogate_reward(batch_advs, new=new_log_ps, old=batch_old_log_ps,
+                                           clip_eps=params.CLIP_EPS)
+
+                # Calculate entropy bonus
+                # So far, the entropy only depends on std and does not depend on time. No need to mask.
+                entropy_bonus = net.entropies(dist).mean()
+
+                # Total loss, is the min of clipped and unclipped reward for each state, averaged.
+                surrogate = (-ch.min(unclp_rew, clp_rew)).mean()
+                entropy = -params.ENTROPY_COEFF * entropy_bonus
+                loss = surrogate + entropy
+                
+                # If we are sharing weights, take the value step simultaneously 
+                # (since the policy and value networks depend on the same weights)
+                if params.SHARE_WEIGHTS:
+                    tup = sel(returns, not_dones, old_vs)
+                    batch_returns, batch_not_dones, batch_old_vs = tup
+                    val_loss = value_step(batch_states, batch_returns, batch_advs,
+                                          batch_not_dones, net.get_value, None, params,
+                                          store, old_vs=batch_old_vs, opt_step=opt_step)
+                    loss += params.VALUE_MULTIPLIER * val_loss
+
+                # Optimizer step (Adam or SGD)
+                if params.POLICY_ADAM is None:
+                    grad = ch.autograd.grad(loss, net.parameters())
+                    flat_grad = flatten(grad)
+                    if params.CLIP_GRAD_NORM != -1:
+                        norm_grad = ch.norm(flat_grad)
+                        flat_grad = flat_grad if norm_grad <= params.CLIP_GRAD_NORM else \
+                                    flat_grad / norm_grad * params.CLIP_GRAD_NORM
+
+                    assign(flatten(net.parameters()) - params.PPO_LR * flat_grad, net.parameters())
+                else:
+                    params.POLICY_ADAM.zero_grad()
+                    loss.backward()
+                    if params.CLIP_GRAD_NORM != -1:
+                        ch.nn.utils.clip_grad_norm(net.parameters(), params.CLIP_GRAD_NORM)
+                    params.POLICY_ADAM.step()
         print(f'surrogate={surrogate.item():8.5f}, entropy={entropy_bonus.item():8.5f}, loss={loss.item():8.5f}')
 
     std = ch.exp(net.log_stdev)
     print(f'std_min={std.min().item():8.5f}, std_max={std.max().item():8.5f}, std_mean={std.mean().item():8.5f}')
 
 
-    return loss
+    return loss.item(), surrogate.item(), entropy.item()
 
 
 """Computing an estimated upper bound of KL divergence using SGLD."""
-def get_state_kl_bound_sgld(net, batch_states, batch_action_means, eps, steps, stdev):
-    batch_action_means = batch_action_means.detach()
+def get_state_kl_bound_sgld(net, batch_states, batch_action_means, eps, steps, stdev, not_dones=None):
+    if not_dones is not None:
+        # If we have not_dones, the underlying network is a LSTM.
+        wrapped_net = functools.partial(net, not_dones=not_dones)
+    else:
+        wrapped_net = net
+    if batch_action_means is None:
+        # Not provided. We need to compute them.
+        with ch.no_grad():
+            batch_action_means, _ = wrapped_net(batch_states)
+    else:
+        batch_action_means = batch_action_means.detach()
     # upper and lower bounds for clipping
     states_ub = batch_states + eps
     states_lb = batch_states - eps
@@ -350,7 +606,7 @@ def get_state_kl_bound_sgld(net, batch_states, batch_action_means, eps, steps, s
     var_states = (batch_states.clone() + noise.sign() * step_eps).detach().requires_grad_()
     for i in range(steps):
         # Find a nearby state new_phi that maximize the difference
-        diff = (net(var_states)[0] - batch_action_means) / stdev.detach()
+        diff = (wrapped_net(var_states)[0] - batch_action_means) / stdev.detach()
         kl = (diff * diff).sum(axis=-1, keepdim=True).mean()
         # Need to clear gradients before the backward() for policy_loss
         kl.backward()
@@ -364,7 +620,7 @@ def get_state_kl_bound_sgld(net, batch_states, batch_action_means, eps, steps, s
         var_states = ch.min(var_states, states_ub)
         var_states = var_states.detach().requires_grad_()
     net.zero_grad()
-    diff = (net(var_states.requires_grad_(False))[0] - batch_action_means) / stdev
+    diff = (wrapped_net(var_states.requires_grad_(False))[0] - batch_action_means) / stdev
     return (diff * diff).sum(axis=-1, keepdim=True)
 
 
@@ -399,103 +655,194 @@ def robust_ppo_step(all_states, actions, old_log_ps, rewards, returns, not_dones
     eps_scheduler.step_epoch()
     beta_scheduler.step_epoch()
 
+    if params.HISTORY_LENGTH > 0:
+        # LSTM policy. Need to go over all episodes instead of states.
+        # We normalize all advantages at once instead of batch by batch, since each batch may contain different number of samples.
+        normalized_advs = adv_normalize(advs)
+        batches, alive_masks, time_masks, lengths = pack_history([all_states, actions, old_log_ps, normalized_advs], not_dones, max_length=params.HISTORY_LENGTH)
+
+
     for _ in range(params.PPO_EPOCHS):
-        # State is in shape (experience_size, observation_size). Usually 2048.
-        state_indices = np.arange(all_states.shape[0])
-        np.random.shuffle(state_indices)
-        # We use a minibatch of states to do optimization, and each epoch contains several iterations.
-        splits = np.array_split(state_indices, params.NUM_MINIBATCHES)
-        # A typical mini-batch size is 2048/32=64
-        for selected in splits:
-            def sel(*args):
-                return [v[selected] for v in args]
+        if params.HISTORY_LENGTH > 0:
+            # LSTM policy. Need to go over all episodes instead of states.
+            params.POLICY_ADAM.zero_grad()
+            hidden = None
+            surrogate = 0.0
+            for i, batch in enumerate(batches):
+                # Now we get chunks of time sequences, each of them with a maximum length of params.HISTORY_LENGTH.
+                # select log probabilities, advantages of this minibatch.
+                batch_states, batch_actions, batch_old_log_ps, batch_advs = batch
+                mask = time_masks[i]
+                """
+                print('batch states', batch_states.size())
+                print('batch actions', batch_actions.size())
+                print('batch old_log_ps', batch_old_log_ps.size())
+                print('batch advs', batch_advs.size())
+                print('alive mask', alive_masks[i].size(), alive_masks[i].sum())
+                print('mask', mask.size())
+                """
+                # keep only the alive hidden states.
+                if hidden is not None:
+                    # print('hidden[0]', hidden[0].size())
+                    hidden = [h[:, alive_masks[i], :].detach() for h in hidden]
+                    # print('hidden[0]', hidden[0].size())
+                # dist contains mean and variance of Gaussian.
+                mean, std, hidden = net.multi_forward(batch_states, hidden=hidden)
+                dist = mean, std
+                # Convert state distribution to log likelyhood.
+                new_log_ps = net.get_loglikelihood(dist, batch_actions)
+                # print('batch new_log_ps', new_log_ps.size())
+                """
+                print('old')
+                print(batch_old_log_ps)
+                print('new')
+                print(new_log_ps * mask)
+                print('diff')
+                print((batch_old_log_ps - new_log_ps * mask).pow(2).sum().item())
+                """
 
-            # old_log_ps: log probabilities of actions sampled based in experience buffer.
-            # advs: advantages of these states.
-            # both old_log_ps and advs are in shape (experience_size,) = 2048.
-            tup = sel(all_states, actions, old_log_ps, advs)
-            # select log probabilities, advantages of this minibatch.
-            batch_states, batch_actions, batch_old_log_ps, batch_advs = tup
+                shape_equal_cmp(new_log_ps, batch_old_log_ps)
 
-            # Forward propagation on current parameters (being constantly updated), to get distribution of these states
-            # dist contains mean and variance of Gaussian.
-            dist = net(batch_states)
-            # Convert state distribution to log likelyhood.
-            new_log_ps = net.get_loglikelihood(dist, batch_actions)
+                # Calculate rewards
+                # the surrogate rewards is basically exp(new_log_ps - old_log_ps) * advantage
+                # dimension is the same as minibatch size.
+                # We already normalized advs before. No need to normalize here.
+                unclp_rew = surrogate_reward(batch_advs, new=new_log_ps, old=batch_old_log_ps, mask=mask, normalize=False)
+                clp_rew = surrogate_reward(batch_advs, new=new_log_ps, old=batch_old_log_ps,
+                                           clip_eps=params.CLIP_EPS, mask=mask, normalize=False)
 
-            shape_equal_cmp(new_log_ps, batch_old_log_ps)
 
-            # Calculate rewards
-            # the surrogate rewards is basically exp(new_log_ps - old_log_ps) * advantage
-            # dimension is the same as minibatch size.
-            unclp_rew = surrogate_reward(batch_advs, new=new_log_ps, old=batch_old_log_ps)
-            clp_rew = surrogate_reward(batch_advs, new=new_log_ps, old=batch_old_log_ps,
-                                       clip_eps=params.CLIP_EPS)
+                # Total loss, is the min of clipped and unclipped reward for each state, averaged.
+                surrogate_batch = (-ch.min(unclp_rew, clp_rew) * mask).sum()
+                # We sum the batch loss here because each batch contains uneven number of trajactories.
+                surrogate = surrogate + surrogate_batch
 
+            # Divide surrogate loss by number of samples in this batch.
+            surrogate = surrogate / all_states.size(0)
             # Calculate entropy bonus
-            entropy_bonus = net.entropies(dist).mean()
-
+            # So far, the entropy only depends on std and does not depend on time. No need to mask.
+            entropy_bonus = net.entropies(dist)
             # Calculate regularizer under state perturbation.
             eps_scheduler.step_batch()
             beta_scheduler.step_batch()
-            batch_action_means = dist[0]
+            batch_action_means = None
             current_eps = eps_scheduler.get_eps()
             stdev = ch.exp(net.log_stdev)
             if params.ROBUST_PPO_DETACH_STDEV:
                 # Detach stdev so that it won't be too large.
                 stdev = stdev.detach()
-            if params.ROBUST_PPO_METHOD == "convex-relax":
-                kl_upper_bound = get_state_kl_bound(relaxed_net, batch_states, batch_action_means,
-                        eps=current_eps, beta=beta_scheduler.get_eps(),
-                        stdev=stdev).mean()
-            elif params.ROBUST_PPO_METHOD == "sgld":
-                kl_upper_bound = get_state_kl_bound_sgld(net, batch_states, batch_action_means,
+            if params.ROBUST_PPO_METHOD == "sgld":
+                kl_upper_bound = get_state_kl_bound_sgld(net, all_states, None,
                         eps=current_eps, steps=params.ROBUST_PPO_PGD_STEPS,
-                        stdev=stdev).mean()
+                        stdev=stdev, not_dones=not_dones).mean()
             else:
                 raise ValueError(f"Unsupported robust PPO method {params.ROBUST_PPO_METHOD}")
-
-            # Total loss, is the min of clipped and unclipped reward for each state, averaged.
-            surrogate = -ch.min(unclp_rew, clp_rew).mean()
             entropy = -params.ENTROPY_COEFF * entropy_bonus
             loss = surrogate + entropy + params.ROBUST_PPO_REG * kl_upper_bound
-            
-            # If we are sharing weights, take the value step simultaneously 
-            # (since the policy and value networks depend on the same weights)
-            if params.SHARE_WEIGHTS:
-                tup = sel(returns, not_dones, old_vs)
-                batch_returns, batch_not_dones, batch_old_vs = tup
-                val_loss = value_step(batch_states, batch_returns, batch_advs,
-                                      batch_not_dones, net.get_value, None, params,
-                                      store, old_vs=batch_old_vs, opt_step=opt_step)
-                loss += params.VALUE_MULTIPLIER * val_loss
+            # optimizer (only ADAM)
+            loss.backward()
+            if params.CLIP_GRAD_NORM != -1:
+                ch.nn.utils.clip_grad_norm(net.parameters(), params.CLIP_GRAD_NORM)
+            params.POLICY_ADAM.step()
+        else:
+            # Memoryless policy.
+            # State is in shape (experience_size, observation_size). Usually 2048.
+            state_indices = np.arange(all_states.shape[0])
+            np.random.shuffle(state_indices)
+            # We use a minibatch of states to do optimization, and each epoch contains several iterations.
+            splits = np.array_split(state_indices, params.NUM_MINIBATCHES)
+            # A typical mini-batch size is 2048/32=64
+            for selected in splits:
+                def sel(*args):
+                    return [v[selected] for v in args]
 
-            # Optimizer step (Adam or SGD)
-            if params.POLICY_ADAM is None:
-                grad = ch.autograd.grad(loss, net.parameters())
-                flat_grad = flatten(grad)
-                if params.CLIP_GRAD_NORM != -1:
-                    norm_grad = ch.norm(flat_grad)
-                    flat_grad = flat_grad if norm_grad <= params.CLIP_GRAD_NORM else \
-                                flat_grad / norm_grad * params.CLIP_GRAD_NORM
+                # old_log_ps: log probabilities of actions sampled based in experience buffer.
+                # advs: advantages of these states.
+                # both old_log_ps and advs are in shape (experience_size,) = 2048.
+                tup = sel(all_states, actions, old_log_ps, advs)
+                # select log probabilities, advantages of this minibatch.
+                batch_states, batch_actions, batch_old_log_ps, batch_advs = tup
 
-                assign(flatten(net.parameters()) - params.PPO_LR * flat_grad, net.parameters())
-            else:
-                params.POLICY_ADAM.zero_grad()
-                loss.backward()
-                if params.CLIP_GRAD_NORM != -1:
-                    ch.nn.utils.clip_grad_norm(net.parameters(), params.CLIP_GRAD_NORM)
-                params.POLICY_ADAM.step()
+                # Forward propagation on current parameters (being constantly updated), to get distribution of these states
+                # dist contains mean and variance of Gaussian.
+                dist = net(batch_states)
+                # Convert state distribution to log likelyhood.
+                new_log_ps = net.get_loglikelihood(dist, batch_actions)
+
+                shape_equal_cmp(new_log_ps, batch_old_log_ps)
+
+                # Calculate rewards
+                # the surrogate rewards is basically exp(new_log_ps - old_log_ps) * advantage
+                # dimension is the same as minibatch size.
+                unclp_rew = surrogate_reward(batch_advs, new=new_log_ps, old=batch_old_log_ps)
+                clp_rew = surrogate_reward(batch_advs, new=new_log_ps, old=batch_old_log_ps,
+                                           clip_eps=params.CLIP_EPS)
+
+                # Calculate entropy bonus
+                entropy_bonus = net.entropies(dist).mean()
+
+                # Calculate regularizer under state perturbation.
+                eps_scheduler.step_batch()
+                beta_scheduler.step_batch()
+                batch_action_means = dist[0]
+                current_eps = eps_scheduler.get_eps()
+                stdev = ch.exp(net.log_stdev)
+                if params.ROBUST_PPO_DETACH_STDEV:
+                    # Detach stdev so that it won't be too large.
+                    stdev = stdev.detach()
+                if params.ROBUST_PPO_METHOD == "convex-relax":
+                    kl_upper_bound = get_state_kl_bound(relaxed_net, batch_states, batch_action_means,
+                            eps=current_eps, beta=beta_scheduler.get_eps(),
+                            stdev=stdev).mean()
+                elif params.ROBUST_PPO_METHOD == "sgld":
+                    kl_upper_bound = get_state_kl_bound_sgld(net, batch_states, batch_action_means,
+                            eps=current_eps, steps=params.ROBUST_PPO_PGD_STEPS,
+                            stdev=stdev).mean()
+                else:
+                    raise ValueError(f"Unsupported robust PPO method {params.ROBUST_PPO_METHOD}")
+
+                # Total loss, is the min of clipped and unclipped reward for each state, averaged.
+                surrogate = -ch.min(unclp_rew, clp_rew).mean()
+                entropy = -params.ENTROPY_COEFF * entropy_bonus
+                loss = surrogate + entropy + params.ROBUST_PPO_REG * kl_upper_bound
+                
+                # If we are sharing weights, take the value step simultaneously 
+                # (since the policy and value networks depend on the same weights)
+                if params.SHARE_WEIGHTS:
+                    tup = sel(returns, not_dones, old_vs)
+                    batch_returns, batch_not_dones, batch_old_vs = tup
+                    val_loss = value_step(batch_states, batch_returns, batch_advs,
+                                          batch_not_dones, net.get_value, None, params,
+                                          store, old_vs=batch_old_vs, opt_step=opt_step)
+                    loss += params.VALUE_MULTIPLIER * val_loss
+
+                # Optimizer step (Adam or SGD)
+                if params.POLICY_ADAM is None:
+                    grad = ch.autograd.grad(loss, net.parameters())
+                    flat_grad = flatten(grad)
+                    if params.CLIP_GRAD_NORM != -1:
+                        norm_grad = ch.norm(flat_grad)
+                        flat_grad = flat_grad if norm_grad <= params.CLIP_GRAD_NORM else \
+                                    flat_grad / norm_grad * params.CLIP_GRAD_NORM
+
+                    assign(flatten(net.parameters()) - params.PPO_LR * flat_grad, net.parameters())
+                else:
+                    params.POLICY_ADAM.zero_grad()
+                    loss.backward()
+                    if params.CLIP_GRAD_NORM != -1:
+                        ch.nn.utils.clip_grad_norm(net.parameters(), params.CLIP_GRAD_NORM)
+                    params.POLICY_ADAM.step()
         # Logging.
         kl_upper_bound = kl_upper_bound.item()
         surrogate = surrogate.item()
         entropy_bonus = entropy_bonus.item()
-        print(f'eps={eps_scheduler.get_eps():8.6f}, beta={beta_scheduler.get_eps():8.6f}, kl={kl_upper_bound:8.5f}, '
+        print(f'eps={eps_scheduler.get_eps():8.6f}, beta={beta_scheduler.get_eps():8.6f}, kl={kl_upper_bound:10.5g}, '
               f'surrogate={surrogate:8.5f}, entropy={entropy_bonus:8.5f}, loss={loss.item():8.5f}')
     std = ch.exp(net.log_stdev)
     print(f'std_min={std.min().item():8.5f}, std_max={std.max().item():8.5f}, std_mean={std.mean().item():8.5f}')
 
     if store is not None:
+        # TODO: ADV: add row name suffix
         row ={
             'eps': eps_scheduler.get_eps(),
             'beta': beta_scheduler.get_eps(),
@@ -506,7 +853,7 @@ def robust_ppo_step(all_states, actions, old_log_ps, rewards, returns, not_dones
         }
         store.log_table_and_tb('robust_ppo_data', row)
 
-    return loss
+    return loss.item(), surrogate, entropy_bonus
 
 def trpo_step(all_states, actions, old_log_ps, rewards, returns, not_dones, advs, net, params, store, opt_step):
     '''
@@ -600,15 +947,30 @@ def trpo_step(all_states, actions, old_log_ps, rewards, returns, not_dones, advs
 
         assign(initial_parameters + final_step, net.parameters())
 
-    return surr_rew
+    # entropy regularization not used for TRPO so return 0.
+    return surr_rew.item(), 0.0, 0.0
 
-def step_with_mode(mode):
+def step_with_mode(mode, adversary=False):
     STEPS = {
         'trpo': trpo_step,
         'ppo': ppo_step,
         'robust_ppo': robust_ppo_step,
+        'adv_ppo': ppo_step,
+        'adv_trpo': trpo_step,
+        'adv_sa_ppo': robust_ppo_step,
     }
-    return STEPS[mode]
+    ADV_STEPS = {
+        'trpo': None,
+        'ppo': None,
+        'robust_ppo': None,
+        'adv_ppo': ppo_step,
+        'adv_trpo': trpo_step,
+        'adv_sa_ppo': ppo_step,
+    }
+    if adversary:
+        return ADV_STEPS[mode]
+    else:
+        return STEPS[mode]
 
 
 def get_params_norm(net, p=2):

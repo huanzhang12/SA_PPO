@@ -3,6 +3,7 @@ import math
 import functools
 import torch as ch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 from .torch_utils import *
 
 '''
@@ -56,7 +57,7 @@ class ValueDenseNet(nn.Module):
     fully connected hidden layers (by default 2 * 128-neuron layers),
     maps a state of size (state_dim) -> a scalar value.
     '''
-    def __init__(self, state_dim, init=None, hidden_sizes=(64, 64)):
+    def __init__(self, state_dim, init=None, hidden_sizes=(64, 64), activation=None):
         '''
         Initializes the value network.
         Inputs:
@@ -66,7 +67,11 @@ class ValueDenseNet(nn.Module):
         Returns: Initialized Value network
         '''
         super().__init__()
-        self.activation = ACTIVATION()
+        if isinstance(activation, str):
+            self.activation = activation_with_name(activation)()
+        else:
+            # Default to tanh.
+            self.activation = ACTIVATION()
         self.affine_layers = nn.ModuleList()
 
         prev = state_dim
@@ -101,6 +106,182 @@ class ValueDenseNet(nn.Module):
 
     def get_value(self, x):
         return self(x)
+
+    def reset(self):
+        return
+
+    # MLP does not maintain history.
+    def pause_history(self):
+        return
+
+    def continue_history(self):
+        return
+
+
+def pack_history(features, not_dones):
+    # Features has dimension (N, state_dim), where N contains a few episodes
+    # not_dones splits these episodes (0 in not_dones is end of an episode)
+    nnz = ch.nonzero(1.0 - not_dones, as_tuple=False).view(-1).cpu().numpy()
+    # nnz has the position where not_dones = 0 (end of episode)
+    all_pieces = []
+    lengths = []
+    start = 0
+    for i in nnz:
+        end = i + 1
+        all_pieces.append(features[start:end, :])
+        lengths.append(end - start)
+        start = end
+    # The last episode is missing, unless the previous episode end at the last element.
+    if end != features.size(0):
+        all_pieces.append(features[end:, :])
+        lengths.append(features.size(0) - end)
+    # print(lengths)
+    padded = pad_sequence(all_pieces, batch_first=True)
+    packed = pack_padded_sequence(padded, lengths, batch_first=True, enforce_sorted=False)
+    return packed
+
+def unpack_history(padded_pieces, lengths):
+    # padded pieces in shape (batch, time, hidden)
+    # lengths in shape (batch,)
+    all_pieces = []
+    for i, l in enumerate(lengths.cpu().numpy()):
+        # For each batch element in padded_pieces, get the first l elements.
+        all_pieces.append(padded_pieces[i, 0:l, :])
+    # return shape (N, hidden)
+    return ch.cat(all_pieces, dim=0)
+
+
+class ValueLSTMNet(nn.Module):
+    '''
+    An example value network, with support for arbitrarily many
+    fully connected hidden layers (by default 2 * 128-neuron layers),
+    maps a state of size (state_dim) -> a scalar value.
+    '''
+    def __init__(self, state_dim, init=None, hidden_sizes=(64, 64), activation=None):
+        '''
+        Initializes the value network.
+        Inputs:
+        - state_dim, the input dimension of the network (i.e dimension of state)
+        - hidden_sizes, an iterable of integers, each of which represents the size
+        of a hidden layer in the neural network.
+        Returns: Initialized Value network
+        '''
+        print('Using LSTM for value function!!')
+        super().__init__()
+        self.hidden_sizes = hidden_sizes
+
+        self.embedding_layer = nn.Linear(state_dim, self.hidden_sizes[0])
+        initialize_weights(self.embedding_layer, init, scale=0.01)
+
+        self.lstm = nn.LSTM(input_size=self.hidden_sizes[0], hidden_size=self.hidden_sizes[1], num_layers=1, batch_first=True)
+
+        self.final = nn.Linear(self.hidden_sizes[-1], 1)
+        if init is not None:
+            initialize_weights(self.final, init, scale=1.0)
+
+        # LSTM hidden states. Only used in inference mode when a batch size of 1 is used.
+        self.hidden = [ch.zeros(1, 1, self.hidden_sizes[1]),
+            ch.zeros(1, 1, self.hidden_sizes[1])]
+        self.paused = False
+
+
+    def initialize(self, init="orthogonal"):
+        for l in self.affine_layers:
+            initialize_weights(l, init)
+        initialize_weights(self.final, init, scale=1.0)
+
+
+    def forward(self, states, not_dones=None):
+        if not_dones is not None:  # we get a full batch of states, we split them into episodes based on not_dones
+            assert states.size(0) == 1 and states.size(1) != 1 and states.ndim == 3  # input dimension must be in shape (1, N, state_dim)
+            # New shape: (N, state_dim)
+            states = states.squeeze(0)
+            features = self.embedding_layer(states)
+            # New shape: (N, )
+            not_dones = not_dones.squeeze(0)
+            # Pack states into episodes according to not_dones
+            packed_features = pack_history(features, not_dones)
+            # Run LSTM
+            outputs, _ = self.lstm(packed_features)
+            # pad output results
+            padded, lengths = pad_packed_sequence(outputs, batch_first=True)
+            # concate output to a single array (N, hidden_dim)
+            hidden = unpack_history(padded, lengths)
+            """
+            hidden = F.relu(features)
+            """
+            # final output, apply linear transformation on hidden output.
+            value = self.final(hidden)
+            """
+            print(states.size(), not_dones.size())
+            print(padded.size())
+            print(hidden.size())
+            print(lengths)
+            print(value.size())
+            import traceback; traceback.print_stack()
+            input()
+            """
+            # add back the extra dimension. Shape (1, N, 1)
+            return value.unsqueeze(0)
+        elif states.ndim == 2 and states.size(0) == 1:
+            # We get a state with batch shape 1. This is only possible in inferece and attack mode.
+            # embedding has shape (1, 1, hidden_dim)
+            embedding = self.embedding_layer(states).unsqueeze(1)
+            # Use saved hidden states
+            _, hidden = self.lstm(embedding, self.hidden)
+            # hidden dimension: (1, 1, hidden_size)
+            output = self.final(hidden[0])
+            # save hidden state.
+            if not self.paused:
+                self.hidden[0] = hidden[0]
+                self.hidden[1] = hidden[1]
+
+            # squeeze the time dimension, return shape (1, action_dim)
+            value = self.final(hidden[0]).squeeze(1)
+            return value
+        else:
+            raise NotImplementedError
+            # state: (N, time, state_dim)
+            embeddings = self.embedding_layer(states)
+            # Run LSTM, output (N, time, hidden_dim)
+            # outputs = F.relu(embeddings)
+            outputs, _ = self.lstm(embeddings)
+            # final output (N, time, 1)
+            value = self.final(outputs)
+            # add back the extra dimension. Shape (1, N, 1)
+            return value
+
+    def multi_forward(self, x, hidden):
+        embeddings = self.embedding_layer(x)
+        # print('embeddings', embeddings.size())
+        # Run LSTM with packed sequence
+        outputs, hidden = self.lstm(embeddings, hidden)
+        # desired outputs dimension: (batch, time_step, hidden_size)
+        # print('outputs', outputs.size())
+        """
+        outputs = F.relu(embeddings)
+        """
+        # print('unpacked_outputs', outputs.size())
+        # value has size (batch, time_step, action_dim)
+        value = self.final(outputs)
+        # print('value', value.size())
+
+        return value, hidden
+
+    def get_value(self, *args):
+        return self(*args)
+
+    # Reset LSTM hidden states.
+    def reset(self):
+        # LSTM hidden states.
+        self.hidden = [ch.zeros(1, 1, self.hidden_sizes[1]),
+            ch.zeros(1, 1, self.hidden_sizes[1])]
+
+    def pause_history(self):
+        self.paused = True
+
+    def continue_history(self):
+        self.paused = False
 
 ########################
 ### POLICY NETWORKS
@@ -402,6 +583,135 @@ class CtsPolicy(nn.Module):
         d = std.shape[0]
         entropies = ch.log(detp) + .5 * (d * (1. + math.log(2 * math.pi)))
         return entropies
+    
+    def reset(self):
+        return
+
+    def pause_history(self):
+        return
+
+    def continue_history(self):
+        return
+
+
+class CtsLSTMPolicy(CtsPolicy):
+    '''
+    A continuous policy using a fully connected neural network.
+    The parameterizing tensor is a mean and standard deviation vector, 
+    which parameterize a gaussian distribution.
+    '''
+    def __init__(self, state_dim, action_dim, init, hidden_sizes=HIDDEN_SIZES,
+                 time_in_state=False, share_weights=False, activation=None, use_merged_bias=False):
+        print('Using LSTM policy!!')
+        assert share_weights is False
+        assert use_merged_bias is False
+        assert time_in_state is False
+        super().__init__(state_dim, action_dim, init, hidden_sizes, time_in_state, share_weights, activation, use_merged_bias)
+        self.hidden_sizes = hidden_sizes
+        self.action_dim = action_dim
+        self.discrete = False
+        self.time_in_state = time_in_state
+        self.use_merged_bias = use_merged_bias
+        self.share_weights = share_weights
+        self.paused = False
+
+        self.embedding_layer = nn.Linear(state_dim, self.hidden_sizes[0])
+        initialize_weights(self.embedding_layer, init, scale=0.01)
+
+        self.lstm = nn.LSTM(input_size=self.hidden_sizes[0], hidden_size=self.hidden_sizes[1], num_layers=1, batch_first=True)
+
+        self.output_layer = nn.Linear(self.hidden_sizes[-1], action_dim)
+        initialize_weights(self.output_layer, init, scale=1.0)
+
+        stdev_init = ch.zeros(action_dim)
+        self.log_stdev = ch.nn.Parameter(stdev_init)
+
+        # LSTM hidden states.
+        self.hidden = [ch.zeros(1, 1, self.hidden_sizes[1]),
+            ch.zeros(1, 1, self.hidden_sizes[1])]
+
+    def forward(self, x, not_dones=None):
+        if isinstance(x, ch.Tensor) and x.size(0) != 1:
+            # We are given a batch of states. We need not_dones to split them into episodes.
+            assert not_dones is not None
+            # input dimension must be in shape (N, state_dim)
+            # not_dones has shape: (N, )
+            # features shape: (N, hidden_dim)
+            features = self.embedding_layer(x)
+            # Pack states into episodes according to not_dones
+            packed_features = pack_history(features, not_dones)
+            # Run LSTM
+            outputs, _ = self.lstm(packed_features)
+            # pad output results
+            padded, lengths = pad_packed_sequence(outputs, batch_first=True)
+            # concate output to a single array (N, hidden_dim)
+            hidden = unpack_history(padded, lengths)
+            """
+            hidden = F.relu(features)
+            """
+            # final output, apply linear transformation on hidden output.
+            means = self.output_layer(hidden)
+            std = ch.exp(self.log_stdev)
+            return means, std
+
+        if isinstance(x, ch.Tensor) and x.ndim == 2:  # inference mode, state input one by one. No time dimension.
+            assert not_dones is None
+            # it must have batch size 1.
+            assert x.size(0) == 1
+            # input x dimension: (1, time_slice, state_dim)
+            # We use torch.nn.utils.rnn.pack_padded_sequence() as input.
+            embedding = self.embedding_layer(x).unsqueeze(0)
+            # embedding dimension: (batch, time_slice, hidden_dim)
+            _, hidden = self.lstm(embedding, self.hidden)
+            # _, hidden = self.lstm(embedding)
+            """
+            hidden = F.relu(embedding)
+            hidden = [hidden, hidden]
+            """
+            # hidden dimension: (1, 1, hidden_size)
+            output = self.output_layer(hidden[0])
+            # save hidden state.
+            if not self.paused:
+                self.hidden[0] = hidden[0]
+                self.hidden[1] = hidden[1]
+
+            means = output.squeeze(0)  # remove the extra dimension.
+            std = ch.exp(self.log_stdev)
+
+            return means, std
+        else:  # with time dimension, used for training LSTM.
+            raise ValueError(f'Unsupported input {x} to LSTM policy')
+
+    def multi_forward(self, x, hidden=None):
+        embeddings = self.embedding_layer(x)
+        # print('embeddings', embeddings.size())
+        # Run LSTM with packed sequence
+        outputs, hidden = self.lstm(embeddings, hidden)
+        # desired outputs dimension: (batch, time_step, hidden_size)
+        # print('outputs', outputs.size())
+        """
+        outputs = F.relu(embeddings)
+        """
+        # print('unpacked_outputs', outputs.size())
+        # means has size (batch, time_step, action_dim)
+        means = self.output_layer(outputs)
+        # print('means', means.size())
+
+        # std is still time and history independent.
+        std = ch.exp(self.log_stdev)
+        return means, std, hidden
+
+    # Reset LSTM hidden states.
+    def reset(self):
+        # LSTM hidden states.
+        self.hidden = [ch.zeros(1, 1, self.hidden_sizes[1]),
+            ch.zeros(1, 1, self.hidden_sizes[1])]
+
+    def pause_history(self):
+        self.paused = True
+
+    def continue_history(self):
+        self.paused = False
 
 
 class CtsPolicyLarger(CtsPolicy):

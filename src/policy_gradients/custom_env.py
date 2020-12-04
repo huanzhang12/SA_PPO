@@ -114,7 +114,7 @@ class Env:
         # Frameskip (every 6 frames, will be rendered at 25 fps)
         if self.save_frames and int(self.counter) % 6 == 0:
             image = self.env.render(mode='rgb_array')
-            path = os.path.join(self.save_frames_path, f"{self.episode_counter:03d}", f"{self.frame_counter:04d}.bmp")
+            path = os.path.join(self.save_frames_path, f"{self.episode_counter:03d}", f"{self.frame_counter+1:04d}.bmp")
             image = Image.fromarray(image)
             image.save(path)
             self.frame_counter += 1
