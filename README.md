@@ -7,10 +7,18 @@ agent that is robust to noises on state observations, including adversarial
 perturbations. See our paper for more details:
 
 *Huan Zhang\*, Hongge Chen\*, Chaowei Xiao, Bo Li, Duane Boning,* and *Cho-Jui
-Hsieh*, "**Robust Deep Reinforcement Learning against Adversarial Perturbations
-on State Observations**". [NeurIPS 2020
-(Spotlight)](https://proceedings.neurips.cc/paper/2020/file/f0eb6568ea114ba6e293f903c34d7488-Paper.pdf)
+Hsieh*, "Robust Deep Reinforcement Learning against Adversarial Perturbations
+on State Observations".  
+[**NeurIPS 2020
+(Spotlight)**](https://proceedings.neurips.cc/paper/2020/file/f0eb6568ea114ba6e293f903c34d7488-Paper.pdf)
 (\*Equal contribution)
+
+**Please also checkout our new work** on **optimal adversary** and the **alternating
+training of learned adversary and agent (ATLA)** framework for training a more robust RL agent which achieves better robustness than SA-PPO (code is available in the [ATLA_Robust_RL repository](https://github.com/huanzhang12/ATLA_robust_RL)):
+
+*Huan Zhang\*, Hongge Chen\*, Duane Boning,*
+and *Cho-Jui Hsieh*, "Robust Reinforcement Learning on State Observations with Learned Optimal Adversary" (\*Equal contribution)    
+[**ICLR 2020**](https://arxiv.org/pdf/2101.08452.pdf) [(Code)](https://github.com/huanzhang12/ATLA_robust_RL)
 
 Our code is based on a carefully implemented PPO baseline:
 [MadryLab/implementation-matters](https://github.com/MadryLab/implementation-matters`).
